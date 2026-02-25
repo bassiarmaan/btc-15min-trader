@@ -17,7 +17,7 @@ class Settings(BaseSettings):
     max_position_pct: float = 0.10
     max_concurrent: int = 5
     daily_loss_limit: float = -200.0
-    max_drawdown_pct: float = 0.05
+    max_drawdown_pct: float = 1.0
 
     # Strategy thresholds
     min_spread_pct: float = 2.0
@@ -25,6 +25,7 @@ class Settings(BaseSettings):
     min_confidence: float = 0.60
     kelly_fraction: float = 0.25
     slippage_bps: float = 50.0
+    early_exit_profit_pct: float = 0.50  # close position when unrealized profit >= this % of cost (0 = disabled)
 
     # Simulation mode (generates synthetic PM markets from real BTC prices)
     simulation_mode: bool = True

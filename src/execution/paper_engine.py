@@ -61,11 +61,61 @@ class PaperEngine:
             mkts = await self._mkt_queue.get()
             for m in mkts:
                 self._live_markets[m.id] = m
-                if m.id in self.positions:
-                    pos = self.positions[m.id]
-                    mid = m.yes_mid if pos.side == Side.YES else m.no_mid
-                    pos.current_price = mid
-                    pos.unrealized_pnl = (mid - pos.entry_price) * pos.num_tokens
+                if m.id not in self.positions:
+                    continue
+                pos = self.positions[m.id]
+                mid = m.yes_mid if pos.side == Side.YES else m.no_mid
+                pos.current_price = mid
+                pos.unrealized_pnl = (mid - pos.entry_price) * pos.num_tokens
+
+                # Early exit for profit only
+                if (
+                    self.s.early_exit_profit_pct > 0
+                    and pos.unrealized_pnl > 0
+                    and pos.cost_basis > 0
+                    and (pos.unrealized_pnl / pos.cost_basis) >= self.s.early_exit_profit_pct
+                ):
+                    self._early_exit(pos, m)
+                    self.positions.pop(m.id, None)
+
+    def _early_exit(self, pos: Position, mkt: Market):
+        """Close position at current (mid) price to lock in profit."""
+        self._roll_day()
+        exit_price = pos.current_price
+        revenue = pos.num_tokens * exit_price
+        pnl = revenue - pos.cost_basis
+        pnl_pct = (pnl / pos.cost_basis * 100) if pos.cost_basis > 0 else 0
+
+        self.balance += revenue
+        self.daily_pnl += pnl
+        self.total_pnl += pnl
+        self.peak_balance = max(self.peak_balance, self.balance)
+
+        trade = Trade(
+            id=uuid.uuid4().hex[:8],
+            market_id=mkt.id,
+            side=pos.side,
+            entry_price=pos.entry_price,
+            exit_price=exit_price,
+            num_tokens=pos.num_tokens,
+            cost_basis=pos.cost_basis,
+            revenue=revenue,
+            pnl=pnl,
+            pnl_pct=pnl_pct,
+            entry_time=pos.entry_time,
+            exit_time=datetime.now(timezone.utc),
+            resolved="EARLY_EXIT",
+            won=True,
+        )
+        self.trades.append(trade)
+        asyncio.get_event_loop().create_task(self.db.save_trade(trade))
+
+        logger.info(
+            "[EARLY_EXIT] %s  PnL=$%+.2f (%+.1f%%)",
+            pos.market_question,
+            pnl,
+            pnl_pct,
+        )
 
     # ------------------------------------------------------------------ #
     #  Trade execution                                                     #
