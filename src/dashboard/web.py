@@ -37,17 +37,15 @@ _state: dict = {
     "strike": 0.0,
     "market_expiry": "",
     "market_id": "",
+    "balance_source": "paper",
 }
+
+_kalshi_balance_data: dict | None = None
 
 
 def init(event_bus: EventBus):
     global _bus
     _bus = event_bus
-
-
-# --------------------------------------------------------------------- #
-#  HTTP + WebSocket endpoints                                             #
-# --------------------------------------------------------------------- #
 
 
 @app.get("/")
@@ -67,11 +65,6 @@ async def ws_endpoint(websocket: WebSocket):
         pass
 
 
-# --------------------------------------------------------------------- #
-#  Background collector — pipes EventBus data into _state dict            #
-# --------------------------------------------------------------------- #
-
-
 async def collect():
     while not _bus:
         await asyncio.sleep(0.1)
@@ -82,6 +75,7 @@ async def collect():
     q_trd = _bus.subscribe("trades_update", maxsize=1)
     q_spr = _bus.subscribe("spread_opportunities", maxsize=1)
     q_mkt = _bus.subscribe("pm_markets", maxsize=1)
+    q_kalshi_bal = _bus.subscribe("kalshi_live_balance", maxsize=1)
 
     async def _btc():
         while True:
@@ -89,26 +83,28 @@ async def collect():
             _state["btc_price"] = t.price
             _state["btc_source"] = t.source
             _state["btc_updated"] = t.timestamp.strftime("%H:%M:%S UTC")
-            _state["price_history"].append(
-                {"t": round(time.time(), 1), "p": round(t.price, 2)}
-            )
+            _state["price_history"].append({"t": round(time.time(), 1), "p": round(t.price, 2)})
             if len(_state["price_history"]) > 1800:
                 _state["price_history"] = _state["price_history"][-1800:]
 
-    async def _mkt():
+    async def _kalshi_balance():
+        global _kalshi_balance_data
         while True:
-            mkts = await q_mkt.get()
-            if mkts:
-                m = mkts[0]
-                _state["strike"] = m.strike
-                _state["market_expiry"] = m.expiry.strftime("%H:%M:%S UTC")
-                _state["market_id"] = m.id
+            data = await q_kalshi_bal.get()
+            _kalshi_balance_data = data
 
     async def _snap():
+        global _kalshi_balance_data
         while True:
             s = await q_snap.get()
             _state["balance"] = round(s.balance, 2)
             _state["equity"] = round(s.equity, 2)
+            if _kalshi_balance_data:
+                _state["balance"] = round(_kalshi_balance_data["balance"], 2)
+                _state["equity"] = round(_kalshi_balance_data["portfolio_value"], 2)
+                _state["balance_source"] = "kalshi"
+            else:
+                _state["balance_source"] = "paper"
             _state["total_pnl"] = round(s.total_pnl, 2)
             _state["daily_pnl"] = round(s.daily_pnl, 2)
             _state["total_trades"] = s.total_trades
@@ -118,7 +114,7 @@ async def collect():
             _state["max_drawdown"] = round(s.max_drawdown_pct, 2)
             _state["num_positions"] = s.num_positions
             _state["pnl_history"].append(
-                {"t": round(time.time(), 1), "pnl": round(s.total_pnl, 2), "eq": round(s.equity, 2)}
+                {"t": round(time.time(), 1), "pnl": round(s.total_pnl, 2), "eq": round(_state["equity"], 2)}
             )
             if len(_state["pnl_history"]) > 600:
                 _state["pnl_history"] = _state["pnl_history"][-600:]
@@ -169,7 +165,16 @@ async def collect():
                 for o in (opps or [])[:8]
             ]
 
-    await asyncio.gather(_btc(), _snap(), _pos(), _trades(), _spreads(), _mkt())
+    async def _mkt():
+        while True:
+            mkts = await q_mkt.get()
+            if mkts:
+                m = mkts[0]
+                _state["strike"] = m.strike
+                _state["market_expiry"] = m.expiry.strftime("%H:%M:%S UTC")
+                _state["market_id"] = m.id
+
+    await asyncio.gather(_btc(), _snap(), _pos(), _trades(), _spreads(), _mkt(), _kalshi_balance())
 
 
 async def serve(port: int = 8080):

@@ -64,6 +64,9 @@ class SignalGenerator:
             return None
         if opp.spread_pct < self.settings.min_edge_pct:
             return None
+        min_ent = getattr(self.settings, "min_entry_price", 0.05)
+        if opp.entry_price < min_ent:
+            return None
 
         payout_ratio = (1.0 / opp.entry_price) - 1 if opp.entry_price > 0 else 0
         win_prob = (

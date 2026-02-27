@@ -49,27 +49,36 @@ class RiskManager:
 
     def _check(self, sig: Signal) -> Signal | None:
         if self._daily_pnl <= self.s.daily_loss_limit:
-            logger.warning("Daily loss limit hit: $%.2f", self._daily_pnl)
+            logger.warning("Risk REJECTED: daily loss limit hit (pnl=$%.2f)", self._daily_pnl)
             return None
 
         if len(self._positions) >= self.s.max_concurrent:
+            logger.info("Risk REJECTED: max concurrent positions (%d)", self.s.max_concurrent)
             return None
 
         if self._peak_balance > 0:
             dd = (self._peak_balance - self._balance) / self._peak_balance
             if dd >= self.s.max_drawdown_pct:
-                logger.warning("Max drawdown hit: %.1f%%", dd * 100)
+                logger.warning("Risk REJECTED: max drawdown hit (%.1f%%)", dd * 100)
                 return None
 
         mid = sig.opportunity.market.id
         if mid in self._positions or mid in self._traded_market_ids:
+            logger.debug("Risk REJECTED: already have position or traded %s", mid)
             return None
 
         max_size = self._balance * self.s.max_position_pct
         kelly_size = self._balance * sig.kelly_fraction
         size = min(kelly_size, max_size, self._balance * 0.20)
-        if size < 1.0:
-            return None
+        min_size = getattr(self.s, "min_position_usd", 1.0)
+        if size < min_size:
+            if size <= 0:
+                logger.info(
+                    "Risk REJECTED: size $%.2f < $%.2f min (kelly=$%.2f max_pct=$%.2f)",
+                    size, min_size, kelly_size, max_size,
+                )
+                return None
+            size = min(min_size, max_size, self._balance * 0.20)
 
         self._traded_market_ids.add(mid)
         # Prune old IDs periodically

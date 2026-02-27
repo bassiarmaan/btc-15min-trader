@@ -42,6 +42,7 @@ class PaperEngine:
         self._resolve_queue = event_bus.subscribe("market_resolved", maxsize=50)
         self._mkt_queue = event_bus.subscribe("pm_markets", maxsize=10)
         self._live_markets: dict[str, Market] = {}
+        self._reversal_placed: set[str] = set()
 
     async def run(self):
         await asyncio.gather(
@@ -68,18 +69,40 @@ class PaperEngine:
                 pos.current_price = mid
                 pos.unrealized_pnl = (mid - pos.entry_price) * pos.num_tokens
 
-                # Early exit for profit only
+                if pos.cost_basis <= 0:
+                    continue
+                loss_ratio = abs(min(0, pos.unrealized_pnl)) / pos.cost_basis
+                profit_ratio = max(0, pos.unrealized_pnl) / pos.cost_basis
+
                 if (
                     self.s.early_exit_profit_pct > 0
                     and pos.unrealized_pnl > 0
-                    and pos.cost_basis > 0
-                    and (pos.unrealized_pnl / pos.cost_basis) >= self.s.early_exit_profit_pct
+                    and profit_ratio >= self.s.early_exit_profit_pct
                 ):
-                    self._early_exit(pos, m)
+                    self._early_exit(pos, m, resolved="EARLY_EXIT", won=True)
                     self.positions.pop(m.id, None)
+                    await self.bus.publish(
+                        "position_closed",
+                        {"market_id": m.id, "side": pos.side, "count": max(1, int(round(pos.num_tokens))), "sell_price": pos.current_price},
+                    )
+                elif (
+                    self.s.early_exit_loss_pct > 0
+                    and pos.unrealized_pnl < 0
+                    and loss_ratio >= self.s.early_exit_loss_pct
+                ):
+                    self._early_exit(pos, m, resolved="EARLY_EXIT_LOSS", won=False)
+                    self.positions.pop(m.id, None)
+                    await self.bus.publish(
+                        "position_closed",
+                        {"market_id": m.id, "side": pos.side, "count": max(1, int(round(pos.num_tokens))), "sell_price": pos.current_price},
+                    )
+                    if self.s.reversal_on_loss_cap and m.id not in self._reversal_placed:
+                        logger.info("REVERSAL: attempting after cut-loss (market=%s)", m.id)
+                        if self._place_reversal_bet(pos, m):
+                            self._reversal_placed.add(m.id)
 
-    def _early_exit(self, pos: Position, mkt: Market):
-        """Close position at current (mid) price to lock in profit."""
+    def _early_exit(self, pos: Position, mkt: Market, resolved: str = "EARLY_EXIT", won: bool = True):
+        """Close position at current (mid) price. Used for take-profit and cut-loss."""
         self._roll_day()
         exit_price = pos.current_price
         revenue = pos.num_tokens * exit_price
@@ -104,18 +127,56 @@ class PaperEngine:
             pnl_pct=pnl_pct,
             entry_time=pos.entry_time,
             exit_time=datetime.now(timezone.utc),
-            resolved="EARLY_EXIT",
-            won=True,
+            resolved=resolved,
+            won=won,
         )
         self.trades.append(trade)
         asyncio.get_event_loop().create_task(self.db.save_trade(trade))
 
         logger.info(
-            "[EARLY_EXIT] %s  PnL=$%+.2f (%+.1f%%)",
+            "[%s] %s  PnL=$%+.2f (%+.1f%%)",
+            resolved,
             pos.market_question,
             pnl,
             pnl_pct,
         )
+
+    def _place_reversal_bet(self, closed_pos: Position, mkt: Market) -> bool:
+        opp_side = Side.NO if closed_pos.side == Side.YES else Side.YES
+        ask = mkt.no_ask if opp_side == Side.NO else mkt.yes_ask
+        if ask >= 0.99:
+            logger.warning("REVERSAL skipped: opposite side %s ask=%.2f (>= 0.99)", opp_side.value, ask)
+            return False
+        slippage = ask * (self.s.slippage_bps / 10_000)
+        fill = ask + slippage
+        if fill >= 0.99:
+            return False
+        cost = min(
+            closed_pos.cost_basis * self.s.reversal_bet_fraction,
+            self.balance * 0.95,
+        )
+        min_cost = getattr(self.s, "min_position_usd", 0.50)
+        if cost <= 0:
+            return False
+        if cost < min_cost:
+            cost = min(min_cost, self.balance * 0.95)
+        tokens = cost / fill
+        self.balance -= cost
+        pos = Position(
+            id=uuid.uuid4().hex[:8],
+            market_id=mkt.id,
+            market_question=mkt.question,
+            side=opp_side,
+            entry_price=fill,
+            num_tokens=tokens,
+            cost_basis=cost,
+            entry_time=datetime.now(timezone.utc),
+            expiry=mkt.expiry,
+            current_price=fill,
+        )
+        self.positions[mkt.id] = pos
+        logger.info("REVERSAL OPEN %s %s @ $%.4f x %.1f tokens = $%.2f", opp_side.value, mkt.question, fill, tokens, cost)
+        return True
 
     # ------------------------------------------------------------------ #
     #  Trade execution                                                     #
@@ -137,7 +198,8 @@ class PaperEngine:
             return
 
         cost = min(sig.position_size_usd, self.balance * 0.95)
-        if cost < 1.0:
+        min_cost = getattr(self.s, "min_position_usd", 0.50)
+        if cost < min_cost:
             return
         tokens = cost / fill
 
@@ -174,6 +236,7 @@ class PaperEngine:
             self._resolve(mkt)
 
     def _resolve(self, mkt: Market):
+        self._reversal_placed.discard(mkt.id)
         if mkt.id not in self.positions:
             return
 

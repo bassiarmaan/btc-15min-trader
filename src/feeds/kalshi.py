@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -25,6 +26,7 @@ class KalshiFeed:
         self.s = settings
         self.markets: dict[str, Market] = {}
         self._prev_active_ids: set[str] = set()
+        self._strike_fallback_logged: set[str] = set()
 
     async def run(self):
         logger.info(
@@ -40,12 +42,7 @@ class KalshiFeed:
                     logger.error("Kalshi poll error: %s", e)
                 await asyncio.sleep(self.s.kalshi_poll_s)
 
-    # ------------------------------------------------------------------ #
-    #  Main poll cycle                                                     #
-    # ------------------------------------------------------------------ #
-
     async def _poll(self, client: httpx.AsyncClient):
-        # 1. Fetch currently open markets
         resp = await client.get(
             f"{self.s.kalshi_api_base}/markets",
             params={
@@ -68,9 +65,38 @@ class KalshiFeed:
             active_ids.add(mkt.id)
             active_markets.append(mkt)
 
+        # If any market has strike=0, try single-market fetch then CEX fallback
+        for mkt in list(active_markets):
+            if mkt.strike > 0:
+                continue
+            strike = await self._fetch_strike(client, mkt.id)
+            if strike > 0:
+                mkt.strike = strike
+                mkt.question = mkt.question or f"BTC price up in next 15 mins? (strike=${strike:,.2f})"
+            else:
+                latest = self.bus.get_latest("btc_price")
+                if latest is not None and getattr(latest, "price", None):
+                    mkt.strike = float(latest.price)
+                    mkt.question = mkt.question or f"BTC price up in next 15 mins? (strike=${mkt.strike:,.2f})"
+                    if mkt.id not in self._strike_fallback_logged:
+                        self._strike_fallback_logged.add(mkt.id)
+                        logger.info(
+                            "Strike fallback: %s using CEX price $%.2f (Kalshi omitted floor_strike)",
+                            mkt.id,
+                            mkt.strike,
+                        )
+                else:
+                    logger.warning(
+                        "Strike still 0 for %s (Kalshi no floor_strike, CEX price not yet available)",
+                        mkt.id,
+                    )
+
+        # Never publish or trade markets with strike=0 — wait until we have a valid strike
+        active_markets = [m for m in active_markets if m.strike > 0]
+        active_ids = {m.id for m in active_markets}
+
         if active_markets:
             await self.bus.publish("pm_markets", active_markets)
-            # Log only when a new market appears
             new = active_ids - self._prev_active_ids
             for nid in new:
                 m = self.markets[nid]
@@ -83,13 +109,10 @@ class KalshiFeed:
                     m.yes_ask * 100,
                 )
 
-        # 2. Check for resolutions — markets that were active last tick
-        #    but are no longer in the active set
         just_closed = self._prev_active_ids - active_ids
         for mid in just_closed:
             await self._check_resolution(client, mid)
 
-        # 3. Also re-check any unresolved markets past their close time
         now = datetime.now(timezone.utc)
         for mid, mkt in list(self.markets.items()):
             if mkt.status != MarketStatus.ACTIVE:
@@ -99,7 +122,6 @@ class KalshiFeed:
 
         self._prev_active_ids = active_ids
 
-        # 4. Cleanup old resolved markets
         cutoff = now - timedelta(minutes=30)
         self.markets = {
             k: v
@@ -107,15 +129,10 @@ class KalshiFeed:
             if v.status == MarketStatus.ACTIVE or v.expiry > cutoff
         }
 
-    # ------------------------------------------------------------------ #
-    #  Resolution                                                          #
-    # ------------------------------------------------------------------ #
-
     async def _check_resolution(self, client: httpx.AsyncClient, mid: str):
         mkt = self.markets.get(mid)
         if not mkt or mkt.status != MarketStatus.ACTIVE:
             return
-
         try:
             resp = await client.get(f"{self.s.kalshi_api_base}/markets/{mid}")
             resp.raise_for_status()
@@ -123,50 +140,63 @@ class KalshiFeed:
         except Exception as e:
             logger.debug("Resolution check failed for %s: %s", mid, e)
             return
-
         result = raw.get("result", "")
         if not result:
-            # Not settled yet — check again next cycle
             return
-
         if result == "yes":
             mkt.status = MarketStatus.RESOLVED_YES
             mkt.yes_mid, mkt.no_mid = 1.0, 0.0
         else:
             mkt.status = MarketStatus.RESOLVED_NO
             mkt.yes_mid, mkt.no_mid = 0.0, 1.0
-
         await self.bus.publish("market_resolved", mkt)
-        logger.info(
-            "RESOLVED %s -> %s (strike=$%.2f)",
-            mkt.id,
-            mkt.status.value,
-            mkt.strike,
-        )
+        logger.info("RESOLVED %s -> %s (strike=$%.2f)", mkt.id, mkt.status.value, mkt.strike)
 
-    # ------------------------------------------------------------------ #
-    #  Conversion                                                          #
-    # ------------------------------------------------------------------ #
+    async def _fetch_strike(self, client: httpx.AsyncClient, ticker: str) -> float:
+        try:
+            resp = await client.get(f"{self.s.kalshi_api_base}/markets/{ticker}")
+            resp.raise_for_status()
+            raw = resp.json().get("market", {})
+            strike = raw.get("floor_strike")
+            if strike is not None:
+                s = float(strike)
+                if s > 100_000:
+                    s = s / 100.0
+                return s if s > 0 else 0.0
+            ev = raw.get("expiration_value")
+            if ev and isinstance(ev, str):
+                try:
+                    val = float(ev.replace(",", "").strip())
+                    if val > 10000:
+                        return val
+                except ValueError:
+                    pass
+            for text in (
+                raw.get("rules_primary") or "",
+                raw.get("title") or "",
+                raw.get("subtitle") or "",
+            ):
+                for match in re.finditer(r"\$?([\d,]+(?:\.\d+)?)", text):
+                    val = float(match.group(1).replace(",", ""))
+                    if val > 10000:
+                        return val
+        except Exception as e:
+            logger.debug("Strike fetch for %s: %s", ticker, e)
+        return 0.0
 
     def _convert(self, raw: dict) -> Market | None:
         ticker = raw.get("ticker", "")
         close = raw.get("close_time")
         if not close or not ticker:
             return None
-
-        # Kalshi prices are in cents (0-100) → convert to 0.00-1.00
         yb = raw.get("yes_bid", 0) / 100
         ya = raw.get("yes_ask", 0) / 100
         nb = raw.get("no_bid", 0) / 100
         na = raw.get("no_ask", 0) / 100
-
-        # floor_strike = BTC price at window open
         strike = float(raw.get("floor_strike", 0) or 0)
-
         expiry = datetime.fromisoformat(close.replace("Z", "+00:00"))
         oi = float(raw.get("open_interest", 0) or 0)
         vol = float(raw.get("volume", 0) or 0)
-
         return Market(
             id=ticker,
             question=raw.get("title") or f"BTC up in 15 min? (>{strike:,.0f})",
