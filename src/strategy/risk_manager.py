@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import asyncio
 import logging
-from datetime import date, datetime, timezone
+import time
+from collections import OrderedDict
 
 from config import Settings
 from src.feeds.event_bus import EventBus
@@ -23,7 +23,8 @@ class RiskManager:
         self._peak_balance: float = settings.initial_balance
         self._daily_pnl: float = 0.0
         self._total_pnl: float = 0.0
-        self._traded_market_ids: set[str] = set()
+        self._traded_market_ids: OrderedDict[str, None] = OrderedDict()
+        self._market_first_signal_time: dict[str, float] = {}
 
     def sync(
         self,
@@ -67,10 +68,31 @@ class RiskManager:
             logger.debug("Risk REJECTED: already have position or traded %s", mid)
             return None
 
+        warmup_s = self.s.min_seconds_after_market_open
+        if warmup_s > 0:
+            now_mono = time.monotonic()
+            if mid not in self._market_first_signal_time:
+                self._market_first_signal_time[mid] = now_mono
+                if len(self._market_first_signal_time) > 200:
+                    cutoff = now_mono - max(warmup_s * 2, 300)
+                    self._market_first_signal_time = {
+                        k: v for k, v in self._market_first_signal_time.items() if v > cutoff
+                    }
+                logger.info(
+                    "Risk DEFER: first signal for %s — wait %.0fs before first entry",
+                    mid[:24] + "…" if len(mid) > 24 else mid,
+                    warmup_s,
+                )
+                return None
+            if (now_mono - self._market_first_signal_time[mid]) < warmup_s:
+                logger.debug("Risk DEFER: market %s still in warmup (%.0fs left)", mid, warmup_s - (now_mono - self._market_first_signal_time[mid]))
+                return None
+            self._market_first_signal_time.pop(mid, None)
+
         max_size = self._balance * self.s.max_position_pct
         kelly_size = self._balance * sig.kelly_fraction
         size = min(kelly_size, max_size, self._balance * 0.20)
-        min_size = getattr(self.s, "min_position_usd", 1.0)
+        min_size = self.s.min_position_usd
         if size < min_size:
             if size <= 0:
                 logger.info(
@@ -80,10 +102,10 @@ class RiskManager:
                 return None
             size = min(min_size, max_size, self._balance * 0.20)
 
-        self._traded_market_ids.add(mid)
-        # Prune old IDs periodically
+        self._traded_market_ids[mid] = None
         if len(self._traded_market_ids) > 500:
-            self._traded_market_ids = set(list(self._traded_market_ids)[-200:])
+            while len(self._traded_market_ids) > 200:
+                self._traded_market_ids.popitem(last=False)
 
         approved = sig.model_copy()
         approved.position_size_usd = size

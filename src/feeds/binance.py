@@ -70,13 +70,13 @@ PROVIDERS = [
 ]
 
 
-class BinanceFeed:
+class PriceFeed:
     """Multi-provider BTC price feed with automatic failover.
 
     Tries Coinbase -> Bybit -> OKX -> Binance, using whichever connects first.
     """
 
-    def __init__(self, event_bus: EventBus, _ws_url: str = ""):
+    def __init__(self, event_bus: EventBus):
         self.bus = event_bus
         self.last_price: float | None = None
         self.last_update: datetime | None = None
@@ -85,19 +85,19 @@ class BinanceFeed:
         self._msg_count = 0
 
     async def run(self):
-        for provider in PROVIDERS:
-            name = provider["name"]
-            url = provider["url"]
-            logger.info("Trying %s WebSocket at %s...", name, url)
-            try:
-                await self._connect(provider)
-            except Exception as e:
-                logger.warning("%s failed: %s — trying next provider", name, e)
-                self.connected = False
-                continue
-        logger.error("All providers exhausted, restarting from top in 5s")
-        await asyncio.sleep(5)
-        await self.run()
+        while True:
+            for provider in PROVIDERS:
+                name = provider["name"]
+                url = provider["url"]
+                logger.info("Trying %s WebSocket at %s...", name, url)
+                try:
+                    await self._connect(provider)
+                except Exception as e:
+                    logger.warning("%s failed: %s — trying next provider", name, e)
+                    self.connected = False
+                    continue
+            logger.error("All providers exhausted, restarting from top in 5s")
+            await asyncio.sleep(5)
 
     async def _connect(self, provider: dict):
         name = provider["name"]

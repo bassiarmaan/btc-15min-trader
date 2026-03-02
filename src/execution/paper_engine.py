@@ -35,6 +35,7 @@ class PaperEngine:
         self.trades: list[Trade] = []
         self.daily_pnl: float = 0.0
         self.total_pnl: float = 0.0
+        self.session_pnl: float = 0.0  # P&L since this process started
         self.peak_balance: float = settings.initial_balance
         self._today: date = datetime.now(timezone.utc).date()
 
@@ -97,14 +98,16 @@ class PaperEngine:
                         {"market_id": m.id, "side": pos.side, "count": max(1, int(round(pos.num_tokens))), "sell_price": pos.current_price},
                     )
                     if self.s.reversal_on_loss_cap and m.id not in self._reversal_placed:
-                        logger.info("REVERSAL: attempting after cut-loss (market=%s)", m.id)
                         if self._place_reversal_bet(pos, m):
                             self._reversal_placed.add(m.id)
 
     def _early_exit(self, pos: Position, mkt: Market, resolved: str = "EARLY_EXIT", won: bool = True):
-        """Close position at current (mid) price. Used for take-profit and cut-loss."""
+        """Close position at current (mid) price minus sell slippage. Used for take-profit and cut-loss."""
         self._roll_day()
-        exit_price = pos.current_price
+        if self.s.kalshi_live_execution:
+            exit_price = max(0.01, pos.current_price - 0.02)
+        else:
+            exit_price = pos.current_price
         revenue = pos.num_tokens * exit_price
         pnl = revenue - pos.cost_basis
         pnl_pct = (pnl / pos.cost_basis * 100) if pos.cost_basis > 0 else 0
@@ -112,6 +115,7 @@ class PaperEngine:
         self.balance += revenue
         self.daily_pnl += pnl
         self.total_pnl += pnl
+        self.session_pnl += pnl
         self.peak_balance = max(self.peak_balance, self.balance)
 
         trade = Trade(
@@ -131,7 +135,7 @@ class PaperEngine:
             won=won,
         )
         self.trades.append(trade)
-        asyncio.get_event_loop().create_task(self.db.save_trade(trade))
+        asyncio.get_running_loop().create_task(self.db.save_trade(trade))
 
         logger.info(
             "[%s] %s  PnL=$%+.2f (%+.1f%%)",
@@ -147,20 +151,29 @@ class PaperEngine:
         if ask >= 0.99:
             logger.warning("REVERSAL skipped: opposite side %s ask=%.2f (>= 0.99)", opp_side.value, ask)
             return False
-        slippage = ask * (self.s.slippage_bps / 10_000)
-        fill = ask + slippage
+        if self.s.kalshi_live_execution:
+            fill = min(0.99, ask + 0.01)
+        else:
+            fill = ask + ask * (self.s.slippage_bps / 10_000)
         if fill >= 0.99:
             return False
+        max_bet = self.balance * self.s.max_position_pct
         cost = min(
             closed_pos.cost_basis * self.s.reversal_bet_fraction,
+            max_bet,
             self.balance * 0.95,
         )
-        min_cost = getattr(self.s, "min_position_usd", 0.50)
+        min_cost = self.s.min_position_usd
         if cost <= 0:
             return False
         if cost < min_cost:
-            cost = min(min_cost, self.balance * 0.95)
-        tokens = cost / fill
+            cost = min(min_cost, max_bet, self.balance * 0.95)
+        if self.s.kalshi_live_execution:
+            tokens = max(1, int(round(cost / fill)))
+            cost = tokens * fill
+        else:
+            tokens = cost / fill
+        count = max(1, int(round(tokens)))
         self.balance -= cost
         pos = Position(
             id=uuid.uuid4().hex[:8],
@@ -168,14 +181,25 @@ class PaperEngine:
             market_question=mkt.question,
             side=opp_side,
             entry_price=fill,
-            num_tokens=tokens,
+            num_tokens=float(count),
             cost_basis=cost,
             entry_time=datetime.now(timezone.utc),
             expiry=mkt.expiry,
             current_price=fill,
         )
         self.positions[mkt.id] = pos
-        logger.info("REVERSAL OPEN %s %s @ $%.4f x %.1f tokens = $%.2f", opp_side.value, mkt.question, fill, tokens, cost)
+        logger.info("REVERSAL OPEN %s %s @ $%.4f x %.1f tokens = $%.2f", opp_side.value, mkt.question, fill, count, cost)
+        # Notify Kalshi live to place the same reversal order on the exchange
+        payload = {
+            "market_id": mkt.id,
+            "side": opp_side.value,
+            "entry_price": fill,
+            "cost_usd": cost,
+            "count": count,
+        }
+        asyncio.get_running_loop().create_task(
+            self.bus.publish("reversal_order", payload)
+        )
         return True
 
     # ------------------------------------------------------------------ #
@@ -192,16 +216,23 @@ class PaperEngine:
         opp = sig.opportunity
         entry = opp.entry_price
 
-        slippage = entry * (self.s.slippage_bps / 10_000)
-        fill = entry + slippage
+        if self.s.kalshi_live_execution:
+            fill = min(0.99, entry + 0.01)
+        else:
+            fill = entry + entry * (self.s.slippage_bps / 10_000)
         if fill >= 0.99:
             return
 
-        cost = min(sig.position_size_usd, self.balance * 0.95)
-        min_cost = getattr(self.s, "min_position_usd", 0.50)
+        max_bet = self.balance * self.s.max_position_pct
+        cost = min(sig.position_size_usd, max_bet, self.balance * 0.95)
+        min_cost = self.s.min_position_usd
         if cost < min_cost:
             return
-        tokens = cost / fill
+        if self.s.kalshi_live_execution:
+            tokens = max(1, int(cost / fill))
+            cost = tokens * fill
+        else:
+            tokens = cost / fill
 
         self.balance -= cost
         pos = Position(
@@ -258,6 +289,7 @@ class PaperEngine:
         self.balance += revenue
         self.daily_pnl += pnl
         self.total_pnl += pnl
+        self.session_pnl += pnl
         self.peak_balance = max(self.peak_balance, self.balance)
 
         trade = Trade(
@@ -277,7 +309,7 @@ class PaperEngine:
             won=won,
         )
         self.trades.append(trade)
-        asyncio.get_event_loop().create_task(self.db.save_trade(trade))
+        asyncio.get_running_loop().create_task(self.db.save_trade(trade))
 
         tag = "WIN" if won else "LOSS"
         logger.info(
@@ -320,11 +352,13 @@ class PaperEngine:
             num_positions=len(self.positions),
             daily_pnl=self.daily_pnl,
             total_pnl=self.total_pnl,
+            session_pnl=self.session_pnl,
             total_trades=n,
             win_rate=wr,
             avg_pnl_per_trade=avg,
             max_drawdown_pct=dd,
             sharpe_ratio=sharpe,
+            initial_balance=self.s.initial_balance,
         )
 
     async def _publish_state(self):

@@ -26,8 +26,6 @@ class KalshiFeed:
         self.s = settings
         self.markets: dict[str, Market] = {}
         self._prev_active_ids: set[str] = set()
-        self._strike_fallback_logged: set[str] = set()
-
     async def run(self):
         logger.info(
             "Kalshi feed starting — series=%s, poll=%.1fs",
@@ -65,33 +63,30 @@ class KalshiFeed:
             active_ids.add(mkt.id)
             active_markets.append(mkt)
 
-        # If any market has strike=0, try single-market fetch then CEX fallback
+        # Always get exact strike from Kalshi: GET /markets/{ticker} has floor_strike; list often omits it
         for mkt in list(active_markets):
-            if mkt.strike > 0:
-                continue
-            strike = await self._fetch_strike(client, mkt.id)
-            if strike > 0:
-                mkt.strike = strike
-                mkt.question = mkt.question or f"BTC price up in next 15 mins? (strike=${strike:,.2f})"
-            else:
-                latest = self.bus.get_latest("btc_price")
-                if latest is not None and getattr(latest, "price", None):
-                    mkt.strike = float(latest.price)
-                    mkt.question = mkt.question or f"BTC price up in next 15 mins? (strike=${mkt.strike:,.2f})"
-                    if mkt.id not in self._strike_fallback_logged:
-                        self._strike_fallback_logged.add(mkt.id)
-                        logger.info(
-                            "Strike fallback: %s using CEX price $%.2f (Kalshi omitted floor_strike)",
+            full = await self._fetch_full_market(client, mkt.id)
+            if full:
+                mkt_full = self._convert(full)
+                if mkt_full:
+                    mkt.strike = mkt_full.strike
+                    mkt.question = mkt_full.question
+                    mkt.yes_bid = mkt_full.yes_bid
+                    mkt.yes_ask = mkt_full.yes_ask
+                    mkt.no_bid = mkt_full.no_bid
+                    mkt.no_ask = mkt_full.no_ask
+                    mkt.yes_mid = mkt_full.yes_mid
+                    mkt.no_mid = mkt_full.no_mid
+                    if mkt_full.strike <= 0:
+                        logger.warning(
+                            "Strike still 0 for %s (Kalshi did not return floor_strike)",
                             mkt.id,
-                            mkt.strike,
                         )
-                else:
-                    logger.warning(
-                        "Strike still 0 for %s (Kalshi no floor_strike, CEX price not yet available)",
-                        mkt.id,
-                    )
+            else:
+                if mkt.strike <= 0:
+                    logger.warning("Could not fetch full market %s for strike", mkt.id)
 
-        # Never publish or trade markets with strike=0 — wait until we have a valid strike
+        # Never publish or trade markets with strike=0 — only use Kalshi's exact strike for live
         active_markets = [m for m in active_markets if m.strike > 0]
         active_ids = {m.id for m in active_markets}
 
@@ -152,36 +147,58 @@ class KalshiFeed:
         await self.bus.publish("market_resolved", mkt)
         logger.info("RESOLVED %s -> %s (strike=$%.2f)", mkt.id, mkt.status.value, mkt.strike)
 
-    async def _fetch_strike(self, client: httpx.AsyncClient, ticker: str) -> float:
+    async def _fetch_full_market(self, client: httpx.AsyncClient, ticker: str) -> dict | None:
+        """GET single market so we have Kalshi's exact floor_strike (list often omits it)."""
         try:
             resp = await client.get(f"{self.s.kalshi_api_base}/markets/{ticker}")
             resp.raise_for_status()
-            raw = resp.json().get("market", {})
-            strike = raw.get("floor_strike")
-            if strike is not None:
-                s = float(strike)
-                if s > 100_000:
-                    s = s / 100.0
-                return s if s > 0 else 0.0
-            ev = raw.get("expiration_value")
-            if ev and isinstance(ev, str):
-                try:
-                    val = float(ev.replace(",", "").strip())
-                    if val > 10000:
-                        return val
-                except ValueError:
-                    pass
-            for text in (
-                raw.get("rules_primary") or "",
-                raw.get("title") or "",
-                raw.get("subtitle") or "",
-            ):
-                for match in re.finditer(r"\$?([\d,]+(?:\.\d+)?)", text):
-                    val = float(match.group(1).replace(",", ""))
-                    if val > 10000:
-                        return val
+            return resp.json().get("market") or None
         except Exception as e:
-            logger.debug("Strike fetch for %s: %s", ticker, e)
+            logger.debug("Full market fetch for %s: %s", ticker, e)
+        return None
+
+    def _parse_price(self, raw: dict, key_cents: str, key_dollars: str, default: float = 0) -> float:
+        """Price can be yes_bid (0-100 cents) or yes_bid_dollars (e.g. '0.52')."""
+        d = raw.get(key_dollars)
+        if d is not None and d != "":
+            try:
+                return float(str(d).strip())
+            except (ValueError, TypeError):
+                pass
+        c = raw.get(key_cents)
+        if c is not None:
+            try:
+                return float(c) / 100.0
+            except (ValueError, TypeError):
+                pass
+        return default
+
+    async def _fetch_strike(self, client: httpx.AsyncClient, ticker: str) -> float:
+        """Used by resolution check; prefer _fetch_full_market + _convert for exact strike."""
+        full = await self._fetch_full_market(client, ticker)
+        if not full:
+            return 0.0
+        strike = full.get("floor_strike")
+        if strike is not None:
+            s = float(strike)
+            return s if s > 0 else 0.0
+        ev = full.get("expiration_value")
+        if ev and isinstance(ev, str):
+            try:
+                val = float(ev.replace(",", "").strip())
+                if val > 10000:
+                    return val
+            except ValueError:
+                pass
+        for text in (
+            full.get("rules_primary") or "",
+            full.get("title") or "",
+            full.get("subtitle") or "",
+        ):
+            for match in re.finditer(r"\$?([\d,]+(?:\.\d+)?)", text):
+                val = float(match.group(1).replace(",", ""))
+                if val > 10000:
+                    return val
         return 0.0
 
     def _convert(self, raw: dict) -> Market | None:
@@ -189,10 +206,10 @@ class KalshiFeed:
         close = raw.get("close_time")
         if not close or not ticker:
             return None
-        yb = raw.get("yes_bid", 0) / 100
-        ya = raw.get("yes_ask", 0) / 100
-        nb = raw.get("no_bid", 0) / 100
-        na = raw.get("no_ask", 0) / 100
+        yb = self._parse_price(raw, "yes_bid", "yes_bid_dollars", 0)
+        ya = self._parse_price(raw, "yes_ask", "yes_ask_dollars", 0)
+        nb = self._parse_price(raw, "no_bid", "no_bid_dollars", 0)
+        na = self._parse_price(raw, "no_ask", "no_ask_dollars", 0)
         strike = float(raw.get("floor_strike", 0) or 0)
         expiry = datetime.fromisoformat(close.replace("Z", "+00:00"))
         oi = float(raw.get("open_interest", 0) or 0)

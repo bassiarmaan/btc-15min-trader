@@ -48,5 +48,5 @@ def price_binary_option(
     if vol_window < 1e-10:
         return 1.0 if spot >= strike else 0.0
 
-    d2 = math.log(spot / strike) / vol_window
+    d2 = (math.log(spot / strike) - 0.5 * vol_window * vol_window) / vol_window
     return max(0.01, min(0.99, norm_cdf(d2)))

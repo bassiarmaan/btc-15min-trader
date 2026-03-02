@@ -12,7 +12,7 @@ from src.utils import kelly_criterion
 
 logger = logging.getLogger(__name__)
 
-COOLDOWN_S = 15.0
+COOLDOWN_S = 5.0
 
 
 class SignalGenerator:
@@ -34,14 +34,28 @@ class SignalGenerator:
                 sig = self._evaluate(opp)
                 if sig:
                     await self.bus.publish("trade_signal", sig)
-                    logger.info(
-                        "SIGNAL %s %s @ $%.4f  edge=%.1f%% conf=%.0f%%",
-                        sig.opportunity.side.value,
-                        sig.opportunity.market.question,
-                        sig.opportunity.entry_price,
-                        sig.edge_pct,
-                        sig.confidence * 100,
-                    )
+                    # fair_yes = P(BTC > strike at expiry). We bet the side that's mispriced vs fair.
+                    f = sig.opportunity.cex_implied_yes
+                    if sig.opportunity.side.value == "NO":
+                        # NO signal when CEX P(up) high = we're value-betting: market has NO cheap vs our fair NO (1 - P(up))
+                        logger.info(
+                            "SIGNAL NO %s @ $%.4f  edge=%.1f%% conf=%.0f%%  (CEX P(up)=%.0f%% → fair NO=%.0f%%, we buy NO cheap)",
+                            sig.opportunity.market.question,
+                            sig.opportunity.entry_price,
+                            sig.edge_pct,
+                            sig.confidence * 100,
+                            f * 100,
+                            (1 - f) * 100,
+                        )
+                    else:
+                        logger.info(
+                            "SIGNAL YES %s @ $%.4f  edge=%.1f%% conf=%.0f%%  (CEX P(up)=%.0f%%, we buy YES cheap)",
+                            sig.opportunity.market.question,
+                            sig.opportunity.entry_price,
+                            sig.edge_pct,
+                            sig.confidence * 100,
+                            f * 100,
+                        )
 
     def _evaluate(self, opp: SpreadOpportunity) -> Signal | None:
         now = datetime.now(timezone.utc)
@@ -64,8 +78,7 @@ class SignalGenerator:
             return None
         if opp.spread_pct < self.settings.min_edge_pct:
             return None
-        min_ent = getattr(self.settings, "min_entry_price", 0.05)
-        if opp.entry_price < min_ent:
+        if opp.entry_price < self.settings.min_entry_price:
             return None
 
         payout_ratio = (1.0 / opp.entry_price) - 1 if opp.entry_price > 0 else 0

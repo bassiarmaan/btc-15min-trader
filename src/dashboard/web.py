@@ -21,8 +21,10 @@ _state: dict = {
     "btc_updated": "--",
     "balance": 10_000.0,
     "equity": 10_000.0,
+    "initial_balance": 10_000.0,
     "total_pnl": 0.0,
     "daily_pnl": 0.0,
+    "session_pnl": 0.0,
     "total_trades": 0,
     "win_rate": 0.0,
     "avg_pnl": 0.0,
@@ -37,10 +39,15 @@ _state: dict = {
     "strike": 0.0,
     "market_expiry": "",
     "market_id": "",
+    "market_yes_bid": 0.0,
+    "market_yes_ask": 0.0,
+    "market_no_bid": 0.0,
+    "market_no_ask": 0.0,
     "balance_source": "paper",
 }
 
 _kalshi_balance_data: dict | None = None
+_kalshi_session_start_equity: float | None = None
 
 
 def init(event_bus: EventBus):
@@ -76,6 +83,7 @@ async def collect():
     q_spr = _bus.subscribe("spread_opportunities", maxsize=1)
     q_mkt = _bus.subscribe("pm_markets", maxsize=1)
     q_kalshi_bal = _bus.subscribe("kalshi_live_balance", maxsize=1)
+    q_kalshi_pos = _bus.subscribe("kalshi_live_positions", maxsize=1)
 
     async def _btc():
         while True:
@@ -94,17 +102,28 @@ async def collect():
             _kalshi_balance_data = data
 
     async def _snap():
-        global _kalshi_balance_data
+        global _kalshi_balance_data, _kalshi_session_start_equity
         while True:
             s = await q_snap.get()
+            initial = getattr(s, "initial_balance", None) or 0.0
             _state["balance"] = round(s.balance, 2)
             _state["equity"] = round(s.equity, 2)
+            _state["initial_balance"] = round(initial, 2)
             if _kalshi_balance_data:
-                _state["balance"] = round(_kalshi_balance_data["balance"], 2)
-                _state["equity"] = round(_kalshi_balance_data["portfolio_value"], 2)
+                k_bal = round(_kalshi_balance_data["balance"], 2)
+                k_eq = round(_kalshi_balance_data["portfolio_value"], 2)
+                if _kalshi_session_start_equity is None and k_eq > 0:
+                    _kalshi_session_start_equity = k_eq
+                _state["balance"] = k_bal
+                _state["equity"] = k_eq
                 _state["balance_source"] = "kalshi"
+                if _kalshi_session_start_equity is not None and k_eq > 0:
+                    _state["session_pnl"] = round(k_eq - _kalshi_session_start_equity, 2)
+                else:
+                    _state["session_pnl"] = round(s.session_pnl, 2)
             else:
                 _state["balance_source"] = "paper"
+                _state["session_pnl"] = round(s.session_pnl, 2)
             _state["total_pnl"] = round(s.total_pnl, 2)
             _state["daily_pnl"] = round(s.daily_pnl, 2)
             _state["total_trades"] = s.total_trades
@@ -114,26 +133,48 @@ async def collect():
             _state["max_drawdown"] = round(s.max_drawdown_pct, 2)
             _state["num_positions"] = s.num_positions
             _state["pnl_history"].append(
-                {"t": round(time.time(), 1), "pnl": round(s.total_pnl, 2), "eq": round(_state["equity"], 2)}
+                {"t": round(time.time(), 1), "pnl": round(_state["session_pnl"], 2), "eq": round(_state["equity"], 2)}
             )
             if len(_state["pnl_history"]) > 600:
                 _state["pnl_history"] = _state["pnl_history"][-600:]
 
+    _kalshi_positions: list[dict] = []
+
+    async def _kalshi_pos():
+        nonlocal _kalshi_positions
+        while True:
+            positions = await q_kalshi_pos.get()
+            _kalshi_positions = positions or []
+
     async def _pos():
         while True:
             positions = await q_pos.get()
-            _state["positions"] = [
-                {
-                    "market": p.market_question,
-                    "side": p.side.value,
-                    "entry": round(p.entry_price, 4),
-                    "current": round(p.current_price, 4),
-                    "pnl": round(p.unrealized_pnl, 2),
-                    "cost": round(p.cost_basis, 2),
-                    "expiry": p.expiry.strftime("%H:%M:%S"),
-                }
-                for p in positions
-            ]
+            if _kalshi_positions:
+                _state["positions"] = [
+                    {
+                        "market": p["ticker"],
+                        "side": p["side"],
+                        "entry": "--",
+                        "current": "--",
+                        "pnl": round(p["market_value"], 2),
+                        "cost": p["count"],
+                        "expiry": "--",
+                    }
+                    for p in _kalshi_positions
+                ]
+            else:
+                _state["positions"] = [
+                    {
+                        "market": p.market_question,
+                        "side": p.side.value,
+                        "entry": round(p.entry_price, 4),
+                        "current": round(p.current_price, 4),
+                        "pnl": round(p.unrealized_pnl, 2),
+                        "cost": round(p.cost_basis, 2),
+                        "expiry": p.expiry.strftime("%H:%M:%S"),
+                    }
+                    for p in positions
+                ]
 
     async def _trades():
         while True:
@@ -173,8 +214,12 @@ async def collect():
                 _state["strike"] = m.strike
                 _state["market_expiry"] = m.expiry.strftime("%H:%M:%S UTC")
                 _state["market_id"] = m.id
+                _state["market_yes_bid"] = m.yes_bid
+                _state["market_yes_ask"] = m.yes_ask
+                _state["market_no_bid"] = m.no_bid
+                _state["market_no_ask"] = m.no_ask
 
-    await asyncio.gather(_btc(), _snap(), _pos(), _trades(), _spreads(), _mkt(), _kalshi_balance())
+    await asyncio.gather(_btc(), _snap(), _kalshi_pos(), _pos(), _trades(), _spreads(), _mkt(), _kalshi_balance())
 
 
 async def serve(port: int = 8080):

@@ -154,8 +154,8 @@ class TerminalDashboard:
             t.add_row("Total Trades", str(s.total_trades))
             t.add_row("Win Rate", f"{s.win_rate:.1f}%")
             t.add_row(
-                "Total P&L",
-                Text(f"${s.total_pnl:+,.2f}", style=_g if s.total_pnl >= 0 else _r),
+                "Session P&L",
+                Text(f"${s.session_pnl:+,.2f}", style=_g if s.session_pnl >= 0 else _r),
             )
             t.add_row(
                 "Daily P&L",

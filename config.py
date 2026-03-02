@@ -9,9 +9,6 @@ class Settings(BaseSettings):
     pm_clob_url: str = "https://clob.polymarket.com"
     pm_gamma_url: str = "https://gamma-api.polymarket.com"
 
-    # Binance public websocket (no key needed)
-    binance_ws_url: str = "wss://stream.binance.com:9443/ws/btcusdt@trade"
-
     # Paper trading
     initial_balance: float = 10_000.0
     max_position_pct: float = 0.10
@@ -25,12 +22,17 @@ class Settings(BaseSettings):
     min_edge_pct: float = 2.0
     min_confidence: float = 0.60
     min_entry_price: float = 0.05  # skip YES/NO below this (avoids 1¢ lottery bets that often go -100%)
+    min_seconds_after_market_open: float = 30.0  # don't take first position until this long after first signal for that market (avoids hasty first tick)
+    # Direction + value: only take YES when spot >= strike, only NO when spot <= strike (reduces fighting the trend)
+    require_directional_alignment: bool = True
+    momentum_lookback_seconds: float = 0.0  # if > 0, YES only when recent price trend up, NO only when down (0 = disable)
+    min_fair_probability: float = 0.55  # model must be at least this confident in the direction (prevents 50/50 flip-flop)
     kelly_fraction: float = 0.25
     slippage_bps: float = 50.0
     early_exit_profit_pct: float = 0.80  # close when unrealized profit >= this % of cost (0 = disabled)
     early_exit_loss_pct: float = 0.50  # close when unrealized loss >= this % of cost (0 = disabled)
     reversal_on_loss_cap: bool = True  # after cut-loss, place one bet on opposite side in same cycle
-    reversal_bet_fraction: float = 0.75  # size reversal bet as this fraction of closed position cost
+    reversal_bet_fraction: float = 0.50  # size reversal bet as this fraction of closed position cost (0.5 = less aggressive)
 
     # Simulation mode (generates synthetic PM markets from real BTC prices)
     simulation_mode: bool = True
@@ -48,7 +50,7 @@ class Settings(BaseSettings):
     kalshi_series: str = "KXBTC15M"
     kalshi_poll_s: float = 2.0
     kalshi_live_execution: bool = False  # place real orders on Kalshi (requires API keys)
-    kalshi_live_max_order_usd: float = 10.0  # cap per order when live (e.g. $5 for $20 bankroll)
+    kalshi_live_max_order_usd: float = 5.0  # hard per-order cap to mirror older $5 behaviour
 
     # Storage
     db_path: str = "data/trades.db"

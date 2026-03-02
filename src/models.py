@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
-from typing import Optional
-
 from pydantic import BaseModel
 
 
@@ -96,8 +94,10 @@ class PortfolioSnapshot(BaseModel):
     num_positions: int
     daily_pnl: float
     total_pnl: float
+    session_pnl: float  # P&L since current process/session started
     total_trades: int
     win_rate: float
     avg_pnl_per_trade: float
     max_drawdown_pct: float
     sharpe_ratio: float
+    initial_balance: float = 0.0  # for dashboard session_pnl when using Kalshi equity

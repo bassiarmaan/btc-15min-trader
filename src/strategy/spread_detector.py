@@ -2,25 +2,33 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
+from collections import deque
 from datetime import datetime, timezone
 
+from config import Settings
 from src.feeds.event_bus import EventBus
 from src.models import Market, MarketStatus, PriceTick, Side, SpreadOpportunity
 from src.utils import price_binary_option
 
 logger = logging.getLogger(__name__)
 
+# Keep ~5 min of 1-sec granularity for momentum (300 points)
+BTC_HISTORY_MAXLEN = 300
+
 
 class SpreadDetector:
     """Layer 1: Continuously scans for CEX-vs-PM spread opportunities."""
 
-    def __init__(self, event_bus: EventBus, min_spread_pct: float = 2.0):
+    def __init__(self, event_bus: EventBus, min_spread_pct: float = 2.0, settings: Settings | None = None):
         self.bus = event_bus
         self.min_spread_pct = min_spread_pct
+        self.settings = settings or None
         self._btc_queue = event_bus.subscribe("btc_price", maxsize=10)
         self._mkt_queue = event_bus.subscribe("pm_markets", maxsize=10)
         self._btc: float | None = None
         self._markets: list[Market] = []
+        self._btc_history: deque[tuple[float, float]] = deque(maxlen=BTC_HISTORY_MAXLEN)
 
     async def run(self):
         await asyncio.gather(
@@ -33,6 +41,8 @@ class SpreadDetector:
         while True:
             tick: PriceTick = await self._btc_queue.get()
             self._btc = tick.price
+            now = time.monotonic()
+            self._btc_history.append((now, tick.price))
 
     async def _consume_markets(self):
         while True:
@@ -44,6 +54,34 @@ class SpreadDetector:
             if self._btc and self._markets:
                 await self._detect()
             await asyncio.sleep(0.05)
+
+    def _direction_alignment_ok(self, side: Side, btc: float, strike: float) -> bool:
+        """Only YES when spot >= strike, only NO when spot <= strike (don't fight the trend)."""
+        if not self.settings or not self.settings.require_directional_alignment:
+            return True
+        if side == Side.YES:
+            return btc >= strike
+        return btc <= strike
+
+    def _momentum_ok(self, side: Side, btc: float) -> bool:
+        """If momentum_lookback_seconds > 0: YES only when price trend up, NO only when down."""
+        lookback = self.settings.momentum_lookback_seconds if self.settings else 0.0
+        if lookback <= 0 or len(self._btc_history) < 2:
+            return True
+        now = time.monotonic()
+        cutoff = now - lookback
+        past_price: float | None = None
+        for t, p in self._btc_history:
+            if t <= cutoff:
+                past_price = p
+            else:
+                break
+        if past_price is None or past_price <= 0:
+            return True
+        # momentum up = btc > past_price, momentum down = btc < past_price
+        if side == Side.YES:
+            return btc >= past_price
+        return btc <= past_price
 
     async def _detect(self):
         btc = self._btc
@@ -57,17 +95,55 @@ class SpreadDetector:
 
             fair_yes = price_binary_option(btc, mkt.strike, remaining)
 
-            # YES opportunity: fair value >> PM ask (PM is stale-low)
+            # YES opportunity: CEX fair YES > Kalshi YES ask → buy YES (bet price up)
             yes_spread = (
                 ((fair_yes - mkt.yes_ask) / fair_yes * 100) if fair_yes > 0.02 else 0
             )
-            # NO opportunity: (1 - fair_yes) >> PM NO ask
+            # NO opportunity: CEX fair NO > Kalshi NO ask → buy NO (bet price not up)
             fair_no = 1 - fair_yes
             no_spread = (
                 ((fair_no - mkt.no_ask) / fair_no * 100) if fair_no > 0.02 else 0
             )
 
-            if yes_spread >= self.min_spread_pct:
+            min_fair = self.settings.min_fair_probability if self.settings else 0.55
+            yes_ok = (
+                yes_spread >= self.min_spread_pct
+                and fair_yes >= min_fair
+                and self._direction_alignment_ok(Side.YES, btc, mkt.strike)
+                and self._momentum_ok(Side.YES, btc)
+            )
+            no_ok = (
+                no_spread >= self.min_spread_pct
+                and fair_no >= min_fair
+                and self._direction_alignment_ok(Side.NO, btc, mkt.strike)
+                and self._momentum_ok(Side.NO, btc)
+            )
+
+            # When both sides have edge + direction, take the one with the *larger* spread
+            if yes_ok and no_ok:
+                if yes_spread >= no_spread:
+                    opportunities.append(
+                        SpreadOpportunity(
+                            market=mkt,
+                            cex_implied_yes=fair_yes,
+                            pm_yes_price=mkt.yes_ask,
+                            spread_pct=yes_spread,
+                            side=Side.YES,
+                            entry_price=mkt.yes_ask,
+                        )
+                    )
+                else:
+                    opportunities.append(
+                        SpreadOpportunity(
+                            market=mkt,
+                            cex_implied_yes=fair_yes,
+                            pm_yes_price=mkt.yes_ask,
+                            spread_pct=no_spread,
+                            side=Side.NO,
+                            entry_price=mkt.no_ask,
+                        )
+                    )
+            elif yes_ok:
                 opportunities.append(
                     SpreadOpportunity(
                         market=mkt,
@@ -78,7 +154,7 @@ class SpreadDetector:
                         entry_price=mkt.yes_ask,
                     )
                 )
-            elif no_spread >= self.min_spread_pct:
+            elif no_ok:
                 opportunities.append(
                     SpreadOpportunity(
                         market=mkt,
