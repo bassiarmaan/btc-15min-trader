@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 from config import Settings
 from src.feeds.event_bus import EventBus
-from src.models import Signal
+from src.models import Market, Signal
 
 logger = logging.getLogger(__name__)
 
@@ -137,6 +137,8 @@ class KalshiLiveEngine:
         self._sig_queue = event_bus.subscribe("approved_signal", maxsize=50)
         self._close_queue = event_bus.subscribe("position_closed", maxsize=50)
         self._reversal_queue = event_bus.subscribe("reversal_order", maxsize=50)
+        self._mkt_queue = event_bus.subscribe("pm_markets", maxsize=10)
+        self._live_markets: dict[str, Market] = {}
         self._private_key = None
         if settings.kalshi_private_key:
             try:
@@ -152,7 +154,19 @@ class KalshiLiveEngine:
             "Kalshi LIVE execution ON — max %.0f%% of balance per order",
             self.s.max_position_pct * 100,
         )
-        await asyncio.gather(self._run_opens(), self._run_closes(), self._run_reversals())
+        await asyncio.gather(
+            self._run_opens(),
+            self._run_closes(),
+            self._run_reversals(),
+            self._run_market_updates(),
+        )
+
+    async def _run_market_updates(self):
+        """Keep current Kalshi order book (yes_ask/no_ask) so we place at market and get filled."""
+        while True:
+            mkts = await self._mkt_queue.get()
+            for m in mkts:
+                self._live_markets[m.id] = m
 
     async def _run_opens(self):
         while True:
@@ -184,14 +198,24 @@ class KalshiLiveEngine:
         if entry <= 0 or entry >= 1:
             logger.warning("LIVE skip: invalid entry price %.4f", entry)
             return
-        fill = min(0.99, entry + 0.01)
-        count = max(1, int(cost_usd / fill))
-        # Kalshi requires 1-cent (0.01) tick
-        raw = fill
-        price_dollars = f"{round(raw, 2):.4f}"
+        if opp.market.strike <= 0:
+            logger.warning("LIVE skip: market %s has no strike (strike=0)", opp.market.id)
+            return
+        # Use current ask from feed so we cross the spread and get filled (not resting)
         ticker = opp.market.id
         side = "yes" if opp.side.value == "YES" else "no"
-
+        mkt = self._live_markets.get(ticker)
+        if mkt is not None:
+            current_ask = mkt.yes_ask if side == "yes" else mkt.no_ask
+            if current_ask > 0 and current_ask < 1:
+                fill = min(0.99, current_ask + 0.02)
+            else:
+                fill = min(0.99, entry + 0.01)
+        else:
+            fill = min(0.99, entry + 0.01)
+        count = max(1, int(cost_usd / fill))
+        raw = round(fill, 2)
+        price_dollars = f"{raw:.4f}"
         path = "/trade-api/v2/portfolio/orders"
         url = self.s.kalshi_api_base.rstrip("/") + "/portfolio/orders"
         body = {

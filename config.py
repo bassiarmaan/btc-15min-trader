@@ -15,7 +15,7 @@ class Settings(BaseSettings):
     max_concurrent: int = 5
     min_position_usd: float = 0.50  # min order size (use 0.50 for small bankrolls)
     daily_loss_limit: float = -999_999.0  # effectively off; set e.g. -200 to cap daily loss
-    max_drawdown_pct: float = 1.0
+    max_drawdown_pct: float = 1.0  # decimal, e.g. 0.18 = 18% — stop new trades when (peak - balance) / peak >= this
 
     # Strategy thresholds
     min_spread_pct: float = 2.0

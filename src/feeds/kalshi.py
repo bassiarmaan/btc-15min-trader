@@ -77,14 +77,29 @@ class KalshiFeed:
                     mkt.no_ask = mkt_full.no_ask
                     mkt.yes_mid = mkt_full.yes_mid
                     mkt.no_mid = mkt_full.no_mid
-                    if mkt_full.strike <= 0:
-                        logger.warning(
-                            "Strike still 0 for %s (Kalshi did not return floor_strike)",
-                            mkt.id,
-                        )
+                    if mkt.strike <= 0:
+                        await asyncio.sleep(0.5)
+                        full_retry = await self._fetch_full_market(client, mkt.id)
+                        if full_retry:
+                            mkt_retry = self._convert(full_retry)
+                            if mkt_retry and mkt_retry.strike > 0:
+                                mkt.strike = mkt_retry.strike
+                        if mkt.strike <= 0:
+                            fallback = await self._fetch_strike(client, mkt.id)
+                            if fallback > 0:
+                                mkt.strike = fallback
+                            if mkt.strike <= 0:
+                                logger.warning(
+                                    "Strike still 0 for %s (Kalshi did not return floor_strike)",
+                                    mkt.id,
+                                )
             else:
                 if mkt.strike <= 0:
-                    logger.warning("Could not fetch full market %s for strike", mkt.id)
+                    fallback = await self._fetch_strike(client, mkt.id)
+                    if fallback > 0:
+                        mkt.strike = fallback
+                    if mkt.strike <= 0:
+                        logger.warning("Could not fetch full market %s for strike", mkt.id)
 
         # Never publish or trade markets with strike=0 — only use Kalshi's exact strike for live
         active_markets = [m for m in active_markets if m.strike > 0]

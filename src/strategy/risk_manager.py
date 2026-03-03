@@ -58,7 +58,7 @@ class RiskManager:
             return None
 
         if self._peak_balance > 0:
-            dd = (self._peak_balance - self._balance) / self._peak_balance
+            dd = (self._peak_balance - self._balance) / self._peak_balance  # drawdown as decimal (0.18 = 18%)
             if dd >= self.s.max_drawdown_pct:
                 logger.warning("Risk REJECTED: max drawdown hit (%.1f%%)", dd * 100)
                 return None
