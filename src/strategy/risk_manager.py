@@ -92,6 +92,13 @@ class RiskManager:
         max_size = self._balance * self.s.max_position_pct
         kelly_size = self._balance * sig.kelly_fraction
         size = min(kelly_size, max_size, self._balance * 0.20)
+        entry_price = sig.opportunity.entry_price
+        if (
+            self.s.low_price_entry_threshold > 0
+            and entry_price < self.s.low_price_entry_threshold
+        ):
+            low_price_cap = self._balance * self.s.low_price_max_position_pct
+            size = min(size, low_price_cap)
         min_size = self.s.min_position_usd
         if size < min_size:
             if size <= 0:

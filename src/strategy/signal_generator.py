@@ -57,6 +57,13 @@ class SignalGenerator:
                             f * 100,
                         )
 
+    def _estimated_execution_cost(self, entry_price: float) -> float:
+        """Estimated round-trip execution cost in price units (paper/live agnostic fallback)."""
+        if entry_price <= 0:
+            return 1.0
+        slip = entry_price * (self.settings.slippage_bps / 10_000)
+        return slip * 2
+
     def _evaluate(self, opp: SpreadOpportunity) -> Signal | None:
         now = datetime.now(timezone.utc)
         remaining = (opp.market.expiry - now).total_seconds()
@@ -69,16 +76,23 @@ class SignalGenerator:
         if mid in self._cooldowns and (now_ts - self._cooldowns[mid]) < COOLDOWN_S:
             return None
 
-        spread_conf = min(1.0, opp.spread_pct / 20.0)
-        time_conf = min(1.0, remaining / 60.0)
-        liq_conf = min(1.0, opp.market.liquidity_usd / 10_000)
-        confidence = spread_conf * 0.50 + time_conf * 0.30 + liq_conf * 0.20
-
-        if confidence < self.settings.min_confidence:
+        min_entry = max(self.settings.min_entry_price, self.settings.hard_min_entry_price)
+        if opp.entry_price < min_entry:
             return None
         if opp.spread_pct < self.settings.min_edge_pct:
             return None
-        if opp.entry_price < self.settings.min_entry_price:
+
+        est_cost = self._estimated_execution_cost(opp.entry_price)
+        est_cost_pct = (est_cost / opp.entry_price) * 100
+        net_edge_pct = opp.spread_pct - est_cost_pct
+        if net_edge_pct < self.settings.min_net_edge_pct:
+            return None
+
+        spread_conf = min(1.0, max(0.0, net_edge_pct) / 20.0)
+        time_conf = min(1.0, remaining / 60.0)
+        liq_conf = min(1.0, opp.market.liquidity_usd / 10_000)
+        confidence = spread_conf * 0.50 + time_conf * 0.30 + liq_conf * 0.20
+        if confidence < self.settings.min_confidence:
             return None
 
         payout_ratio = (1.0 / opp.entry_price) - 1 if opp.entry_price > 0 else 0
@@ -89,6 +103,9 @@ class SignalGenerator:
         )
         full_kelly = kelly_criterion(win_prob, payout_ratio)
         quarter_kelly = full_kelly * self.settings.kelly_fraction
+        if self.settings.kelly_confidence_weight > 0:
+            quarter_kelly *= confidence ** self.settings.kelly_confidence_weight
+        quarter_kelly = min(quarter_kelly, self.settings.max_signal_kelly_fraction)
         if quarter_kelly <= 0:
             return None
 
@@ -103,7 +120,7 @@ class SignalGenerator:
         return Signal(
             opportunity=opp,
             confidence=confidence,
-            edge_pct=opp.spread_pct,
+            edge_pct=net_edge_pct,
             kelly_fraction=quarter_kelly,
             position_size_usd=0,
             timestamp=now,

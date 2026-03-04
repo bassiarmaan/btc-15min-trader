@@ -29,6 +29,9 @@ class SpreadDetector:
         self._btc: float | None = None
         self._markets: list[Market] = []
         self._btc_history: deque[tuple[float, float]] = deque(maxlen=BTC_HISTORY_MAXLEN)
+        self._last_btc_update: float = 0.0
+        self._last_market_update: float = 0.0
+        self._last_stale_log: float = 0.0
 
     async def run(self):
         await asyncio.gather(
@@ -43,15 +46,38 @@ class SpreadDetector:
             self._btc = tick.price
             now = time.monotonic()
             self._btc_history.append((now, tick.price))
+            self._last_btc_update = now
 
     async def _consume_markets(self):
         while True:
             mkts = await self._mkt_queue.get()
             self._markets = [m for m in mkts if m.status == MarketStatus.ACTIVE]
+            self._last_market_update = time.monotonic()
+
+    def _data_fresh(self) -> bool:
+        if not self.settings:
+            return True
+        now = time.monotonic()
+        btc_stale = self.settings.max_btc_stale_s > 0 and (
+            (self._last_btc_update <= 0) or (now - self._last_btc_update > self.settings.max_btc_stale_s)
+        )
+        market_stale = self.settings.max_market_stale_s > 0 and (
+            (self._last_market_update <= 0) or (now - self._last_market_update > self.settings.max_market_stale_s)
+        )
+        if btc_stale or market_stale:
+            if now - self._last_stale_log >= 15:
+                logger.warning(
+                    "Spread scan paused: stale data (btc_age=%.1fs, market_age=%.1fs)",
+                    now - self._last_btc_update if self._last_btc_update > 0 else -1.0,
+                    now - self._last_market_update if self._last_market_update > 0 else -1.0,
+                )
+                self._last_stale_log = now
+            return False
+        return True
 
     async def _scan_loop(self):
         while True:
-            if self._btc and self._markets:
+            if self._btc and self._markets and self._data_fresh():
                 await self._detect()
             await asyncio.sleep(0.05)
 
@@ -88,32 +114,41 @@ class SpreadDetector:
         now = datetime.now(timezone.utc)
         opportunities: list[SpreadOpportunity] = []
 
+        vol = self.settings.btc_pricing_vol if self.settings else 0.70
+        min_edge_prob = self.settings.min_edge_prob if self.settings else 0.03
+        shrink = self.settings.fair_value_shrink if self.settings else 0.0
+
         for mkt in self._markets:
             remaining = (mkt.expiry - now).total_seconds()
             if remaining <= 5:
                 continue
 
-            fair_yes = price_binary_option(btc, mkt.strike, remaining)
+            fair_yes = price_binary_option(btc, mkt.strike, remaining, annual_vol=vol)
+            if shrink > 0:
+                fair_yes = 0.5 + (1.0 - shrink) * (fair_yes - 0.5)
+            fair_no = 1.0 - fair_yes
 
-            # YES opportunity: CEX fair YES > Kalshi YES ask → buy YES (bet price up)
+            # Edge in probability (absolute); spread_pct for filtering/ordering
+            yes_edge_prob = fair_yes - mkt.yes_ask
+            no_edge_prob = fair_no - mkt.no_ask
             yes_spread = (
-                ((fair_yes - mkt.yes_ask) / fair_yes * 100) if fair_yes > 0.02 else 0
+                (yes_edge_prob / fair_yes * 100) if fair_yes > 0.02 else 0
             )
-            # NO opportunity: CEX fair NO > Kalshi NO ask → buy NO (bet price not up)
-            fair_no = 1 - fair_yes
             no_spread = (
-                ((fair_no - mkt.no_ask) / fair_no * 100) if fair_no > 0.02 else 0
+                (no_edge_prob / fair_no * 100) if fair_no > 0.02 else 0
             )
 
             min_fair = self.settings.min_fair_probability if self.settings else 0.55
             yes_ok = (
                 yes_spread >= self.min_spread_pct
+                and yes_edge_prob >= min_edge_prob
                 and fair_yes >= min_fair
                 and self._direction_alignment_ok(Side.YES, btc, mkt.strike)
                 and self._momentum_ok(Side.YES, btc)
             )
             no_ok = (
                 no_spread >= self.min_spread_pct
+                and no_edge_prob >= min_edge_prob
                 and fair_no >= min_fair
                 and self._direction_alignment_ok(Side.NO, btc, mkt.strike)
                 and self._momentum_ok(Side.NO, btc)

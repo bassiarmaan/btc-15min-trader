@@ -32,13 +32,23 @@ class KalshiFeed:
             self.s.kalshi_series,
             self.s.kalshi_poll_s,
         )
+        fail_count = 0
         async with httpx.AsyncClient(timeout=10) as client:
             while True:
                 try:
                     await self._poll(client)
+                    fail_count = 0
+                    await asyncio.sleep(self.s.kalshi_poll_s)
                 except Exception as e:
-                    logger.error("Kalshi poll error: %s", e)
-                await asyncio.sleep(self.s.kalshi_poll_s)
+                    fail_count += 1
+                    backoff = min(15.0, self.s.kalshi_poll_s * (2 ** min(fail_count, 4)))
+                    logger.error(
+                        "Kalshi poll error (%s): %s; retrying in %.1fs",
+                        type(e).__name__,
+                        e,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
 
     async def _poll(self, client: httpx.AsyncClient):
         resp = await client.get(
