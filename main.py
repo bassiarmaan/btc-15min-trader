@@ -97,7 +97,7 @@ async def main():
 
     try:
         from src.dashboard.web import init as web_init, collect as web_collect, serve as web_serve
-        web_init(bus)
+        web_init(bus, live_mode=bool(settings.kalshi_mode and settings.kalshi_live_execution))
         has_web = True
     except ImportError:
         has_web = False
@@ -166,7 +166,8 @@ async def main():
             if bal_data:
                 k_eq = bal_data["portfolio_value"]
                 k_bal = bal_data["balance"]
-                session = k_eq - startup_balance
+                # Live session P&L should track cash balance delta from process start.
+                session = k_bal - startup_balance
                 log.info("Kalshi Bal : $%.2f", k_bal)
                 log.info("Kalshi Eq  : $%.2f", k_eq)
                 log.info("Session P&L: $%+.2f", session)

@@ -214,6 +214,7 @@ class KalshiLiveEngine:
         else:
             fill = min(0.99, entry + 0.01)
         count = max(1, int(cost_usd / fill))
+        count = min(count, max(1, self.s.kalshi_live_max_contracts))
         raw = round(fill, 2)
         price_dollars = f"{raw:.4f}"
         path = "/trade-api/v2/portfolio/orders"
@@ -332,6 +333,7 @@ class KalshiLiveEngine:
         if not market_id or side not in ("yes", "no") or count < 1 or entry_price <= 0 or entry_price >= 1:
             logger.warning("LIVE reversal skip: invalid payload %s", payload)
             return
+        count = min(count, max(1, self.s.kalshi_live_max_contracts))
         # Kalshi requires 1-cent (0.01) tick
         raw = min(0.99, entry_price + 0.01)
         price = round(raw, 2)

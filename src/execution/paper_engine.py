@@ -170,6 +170,7 @@ class PaperEngine:
             cost = min(min_cost, max_bet, self.balance * 0.95)
         if self.s.kalshi_live_execution:
             tokens = max(1, int(round(cost / fill)))
+            tokens = min(tokens, max(1, self.s.kalshi_live_max_contracts))
             cost = tokens * fill
         else:
             tokens = cost / fill
@@ -230,6 +231,7 @@ class PaperEngine:
             return
         if self.s.kalshi_live_execution:
             tokens = max(1, int(cost / fill))
+            tokens = min(tokens, max(1, self.s.kalshi_live_max_contracts))
             cost = tokens * fill
         else:
             tokens = cost / fill

@@ -212,6 +212,7 @@
     <span class="status-pill" id="status-pill"><span id="status-text">CONNECTING</span></span>
     <div class="header-stats">
       <div class="stat-item"><span class="label">Balance</span><span class="value" id="h-bal">$—</span></div>
+      <div class="stat-item"><span class="label">Start</span><span class="value" id="h-start-bal">$—</span></div>
       <div class="stat-item"><span class="label">Session P&L</span><span class="value" id="h-pnl">$—</span></div>
       <div class="stat-item"><span class="label">Win rate</span><span class="value" id="h-wr">—</span></div>
     </div>
@@ -278,9 +279,10 @@
   </div>
 </div>
 
-<div id="tab-trades" class="tab-content">
+  <div id="tab-trades" class="tab-content">
   <div class="card">
     <div class="card-hdr">Trade history</div>
+    <div id="trades-note" style="display:none; margin-bottom:0.75rem; color:var(--muted); font-size:0.85rem;"></div>
     <table>
       <thead><tr><th>Time</th><th>Side</th><th>Entry</th><th>Exit</th><th>P&L</th><th>Return</th><th>Result</th></tr></thead>
       <tbody id="trades-tbody"></tbody>
@@ -438,6 +440,8 @@
 
     $('h-bal').textContent = '$' + F(d.balance);
     $('h-bal').className = 'value';
+    $('h-start-bal').textContent = '$' + F(d.initial_balance || 0);
+    $('h-start-bal').className = 'value';
     $('h-pnl').textContent = (d.session_pnl >= 0 ? '+' : '') + '$' + F(d.session_pnl);
     $('h-pnl').className = 'value ' + cls(d.session_pnl);
     $('h-wr').textContent = d.total_trades ? d.win_rate.toFixed(1) + '%' : '—';
@@ -486,6 +490,15 @@
     } else {
       $('pos-empty').style.display = 'block';
       $('pos-table').style.display = 'none';
+    }
+
+    var tradesNote = $('trades-note');
+    if (d.trades_note) {
+      tradesNote.style.display = 'block';
+      tradesNote.textContent = d.trades_note;
+    } else {
+      tradesNote.style.display = 'none';
+      tradesNote.textContent = '';
     }
 
     $('trades-tbody').innerHTML = (d.trades || []).slice(0, 50).map(t => '<tr><td>' + t.time + '</td><td><span class="tag t-' + t.side.toLowerCase() + '">' + t.side + '</span></td><td class="mono">$' + t.entry + '</td><td class="mono">$' + F(t.exit) + '</td><td class="mono" style="color:var(' + (t.pnl >= 0 ? '--green' : '--red') + ')">$' + (t.pnl >= 0 ? '+' : '') + F(t.pnl) + '</td><td class="mono" style="color:var(' + (t.pnl_pct >= 0 ? '--green' : '--red') + ')">' + (t.pnl_pct >= 0 ? '+' : '') + F(t.pnl_pct) + '%</td><td><span class="tag ' + (t.won ? 't-yes' : 't-no') + '">' + (t.won ? 'WIN' : 'LOSS') + '</span></td></tr>').join('');

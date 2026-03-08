@@ -63,6 +63,7 @@ class Settings(BaseSettings):
     kalshi_poll_s: float = 2.0
     kalshi_live_execution: bool = False  # place real orders on Kalshi (requires API keys)
     kalshi_live_max_order_usd: float = 5.0  # hard per-order cap to mirror older $5 behaviour
+    kalshi_live_max_contracts: int = 1  # hard cap on contracts per live buy order
 
     # Storage
     db_path: str = "data/trades.db"
