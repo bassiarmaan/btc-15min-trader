@@ -44,6 +44,15 @@ def _sign_request(private_key, timestamp: str, method: str, path: str) -> str:
     return base64.b64encode(signature).decode("ascii")
 
 
+def _to_int(value, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 async def fetch_kalshi_positions(settings: Settings) -> list[dict] | None:
     """Fetch live Kalshi open positions. Returns list of position dicts or None on failure."""
     if not settings.kalshi_api_key_id or not settings.kalshi_private_key:
@@ -90,6 +99,15 @@ async def fetch_kalshi_positions(settings: Settings) -> list[dict] | None:
                         "side": "NO",
                         "count": abs(yes_count),
                         "market_value": market_value,
+                        "resting_orders": resting,
+                    })
+                elif resting > 0:
+                    # Surface resting-only orders in dashboard even when position is flat.
+                    positions.append({
+                        "ticker": ticker,
+                        "side": "RESTING",
+                        "count": 0,
+                        "market_value": 0.0,
                         "resting_orders": resting,
                     })
         return positions
@@ -245,6 +263,10 @@ class KalshiLiveEngine:
             if resp.status_code == 201:
                 data = resp.json()
                 order = data.get("order", {})
+                status = str(order.get("status", "")).lower()
+                total = _to_int(order.get("count"), count)
+                remaining = _to_int(order.get("remaining_count"), max(total, count))
+                filled = max(0, total - remaining)
                 logger.info(
                     "LIVE ORDER PLACED on Kalshi: %s %s %s x %d @ %s (order_id=%s)",
                     side.upper(),
@@ -254,6 +276,23 @@ class KalshiLiveEngine:
                     price_dollars,
                     order.get("order_id", "?"),
                 )
+                logger.info(
+                    "LIVE ORDER STATUS: %s %s order_id=%s status=%s filled=%d remaining=%d",
+                    side.upper(),
+                    ticker,
+                    order.get("order_id", "?"),
+                    status or "unknown",
+                    filled,
+                    remaining,
+                )
+                if status and status not in {"executed", "filled"} and filled <= 0:
+                    logger.warning(
+                        "LIVE order accepted but not filled yet (%s %s, status=%s, remaining=%d)",
+                        side.upper(),
+                        ticker,
+                        status,
+                        remaining,
+                    )
             else:
                 logger.error(
                     "Kalshi order failed: %s %s — %s",

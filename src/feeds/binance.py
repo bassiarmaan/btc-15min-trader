@@ -6,6 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 from src.feeds.event_bus import EventBus
 from src.models import PriceTick
@@ -82,7 +83,6 @@ class PriceFeed:
         self.last_update: datetime | None = None
         self.connected = False
         self.provider_name = ""
-        self._msg_count = 0
 
     async def run(self):
         while True:
@@ -105,7 +105,15 @@ class PriceFeed:
         sub_msg = provider["subscribe"]
         extract = provider["extract"]
 
-        async with websockets.connect(url, ping_interval=20) as ws:
+        # Disable built-in keepalive pings to avoid legacy protocol assertion errors;
+        # rely on recv timeout + reconnect instead.
+        async with websockets.connect(
+            url,
+            ping_interval=None,
+            ping_timeout=None,
+            close_timeout=5,
+            max_queue=1024,
+        ) as ws:
             self.connected = True
             self.provider_name = name
             logger.info("Connected to %s", name)
@@ -113,8 +121,19 @@ class PriceFeed:
             if sub_msg:
                 await ws.send(sub_msg())
 
-            async for raw in ws:
-                data = json.loads(raw)
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=15.0)
+                except asyncio.TimeoutError:
+                    raise ConnectionError(f"{name} websocket idle timeout")
+                except ConnectionClosed:
+                    raise
+
+                try:
+                    data = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+
                 result = extract(data)
                 if result is None:
                     continue
@@ -122,8 +141,7 @@ class PriceFeed:
                 price, ts = result
                 self.last_price = price
                 self.last_update = ts
-                self._msg_count += 1
 
-                if self._msg_count % 3 == 0:
-                    tick = PriceTick(price=price, timestamp=ts, source=name.lower())
-                    await self.bus.publish("btc_price", tick)
+                # Publish every valid tick so stale detection reflects real feed liveness.
+                tick = PriceTick(price=price, timestamp=ts, source=name.lower())
+                await self.bus.publish("btc_price", tick)

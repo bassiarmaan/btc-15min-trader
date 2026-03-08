@@ -175,12 +175,16 @@ async def collect():
             if _live_mode:
                 _state["positions"] = [
                     {
-                        "market": p["ticker"],
+                        "market": (
+                            f'{p["ticker"]} (resting {p.get("resting_orders", 0)})'
+                            if p.get("side") == "RESTING"
+                            else p["ticker"]
+                        ),
                         "side": p["side"],
                         "entry": "--",
                         "current": "--",
                         "pnl": round(p["market_value"], 2),
-                        "cost": p["count"],
+                        "cost": p.get("count", 0),
                         "expiry": "--",
                     }
                     for p in _kalshi_positions
@@ -188,12 +192,16 @@ async def collect():
             elif _kalshi_positions:
                 _state["positions"] = [
                     {
-                        "market": p["ticker"],
+                        "market": (
+                            f'{p["ticker"]} (resting {p.get("resting_orders", 0)})'
+                            if p.get("side") == "RESTING"
+                            else p["ticker"]
+                        ),
                         "side": p["side"],
                         "entry": "--",
                         "current": "--",
                         "pnl": round(p["market_value"], 2),
-                        "cost": p["count"],
+                        "cost": p.get("count", 0),
                         "expiry": "--",
                     }
                     for p in _kalshi_positions

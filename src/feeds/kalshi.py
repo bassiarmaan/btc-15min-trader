@@ -26,6 +26,7 @@ class KalshiFeed:
         self.s = settings
         self.markets: dict[str, Market] = {}
         self._prev_active_ids: set[str] = set()
+        self._strike_warn_at: dict[str, float] = {}
     async def run(self):
         logger.info(
             "Kalshi feed starting — series=%s, poll=%.1fs",
@@ -99,17 +100,14 @@ class KalshiFeed:
                             if fallback > 0:
                                 mkt.strike = fallback
                             if mkt.strike <= 0:
-                                logger.warning(
-                                    "Strike still 0 for %s (Kalshi did not return floor_strike)",
-                                    mkt.id,
-                                )
+                                self._log_strike_missing(mkt.id)
             else:
                 if mkt.strike <= 0:
                     fallback = await self._fetch_strike(client, mkt.id)
                     if fallback > 0:
                         mkt.strike = fallback
                     if mkt.strike <= 0:
-                        logger.warning("Could not fetch full market %s for strike", mkt.id)
+                        self._log_strike_missing(mkt.id)
 
         # Never publish or trade markets with strike=0 — only use Kalshi's exact strike for live
         active_markets = [m for m in active_markets if m.strike > 0]
@@ -148,6 +146,19 @@ class KalshiFeed:
             for k, v in self.markets.items()
             if v.status == MarketStatus.ACTIVE or v.expiry > cutoff
         }
+        self._strike_warn_at = {
+            k: v
+            for k, v in self._strike_warn_at.items()
+            if k in self.markets
+        }
+
+    def _log_strike_missing(self, ticker: str):
+        now = asyncio.get_running_loop().time()
+        last = self._strike_warn_at.get(ticker, 0.0)
+        # Same issue can persist for minutes; rate-limit warning noise.
+        if now - last >= 30.0:
+            logger.warning("Strike still 0 for %s (Kalshi did not return floor_strike)", ticker)
+            self._strike_warn_at[ticker] = now
 
     async def _check_resolution(self, client: httpx.AsyncClient, mid: str):
         mkt = self.markets.get(mid)
@@ -236,6 +247,34 @@ class KalshiFeed:
         nb = self._parse_price(raw, "no_bid", "no_bid_dollars", 0)
         na = self._parse_price(raw, "no_ask", "no_ask_dollars", 0)
         strike = float(raw.get("floor_strike", 0) or 0)
+        if strike <= 0:
+            # Some payloads expose strike in alternate fields.
+            for key in ("strike", "strike_price", "expiration_value"):
+                val = raw.get(key)
+                if val is None or val == "":
+                    continue
+                try:
+                    cand = float(str(val).replace(",", "").strip())
+                except (TypeError, ValueError):
+                    continue
+                if cand > 10000:
+                    strike = cand
+                    break
+        if strike <= 0:
+            # Fallback from text fields if present (e.g., "Price to beat: $67,264.95").
+            for text in (
+                raw.get("functional_strike") or "",
+                raw.get("title") or "",
+                raw.get("subtitle") or "",
+                raw.get("rules_primary") or "",
+            ):
+                for match in re.finditer(r"\$?([\d,]+(?:\.\d+)?)", str(text)):
+                    cand = float(match.group(1).replace(",", ""))
+                    if cand > 10000:
+                        strike = cand
+                        break
+                if strike > 0:
+                    break
         expiry = datetime.fromisoformat(close.replace("Z", "+00:00"))
         oi = float(raw.get("open_interest", 0) or 0)
         vol = float(raw.get("volume", 0) or 0)
